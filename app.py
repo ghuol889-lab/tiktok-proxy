@@ -79,7 +79,6 @@ async def dl(request: Request, url: str):
                 async for chunk in stream.aiter_bytes():
                     yield chunk
 
-        # формируем ответ, пробрасываем базовые заголовки
         media_type = stream.headers.get("content-type", "video/mp4")
         resp = StreamingResponse(generate(),
                                  status_code=stream.status_code,
