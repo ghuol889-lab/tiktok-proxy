@@ -59,36 +59,27 @@ def api(url: str):
 async def dl(request: Request, url: str):
     """
     Стримим видео в ответ.
-    ВАЖНО: держим httpx-клиент и stream ОТКРЫТЫМИ внутри генератора,
-    чтобы не схлопывался поток (иначе будет 500).
+    ВАЖНО: открываем httpx-клиент и поток ВНУТРИ генератора,
+    чтобы соединение не схлопывалось (иначе будет 500).
+    Никаких попыток читать stream.headers снаружи — это ломает поток.
     """
     try:
         vurl, _ = extract(url)
         if not vurl:
             return JSONResponse({"ok": False, "error": "no_video"}, status_code=404)
 
-        headers = {"User-Agent": UA, "Referer": "https://www.tiktok.com/"}
+        req_headers = {"User-Agent": UA, "Referer": "https://www.tiktok.com/"}
         if "range" in request.headers:
-            headers["Range"] = request.headers["range"]
+            req_headers["Range"] = request.headers["range"]
 
-        client = httpx.AsyncClient(follow_redirects=True, timeout=120)
-        stream = await client.stream("GET", vurl, headers=headers)
+        async def body():
+            async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
+                async with client.stream("GET", vurl, headers=req_headers) as r:
+                    async for chunk in r.aiter_bytes():
+                        yield chunk
 
-        async def generate():
-            async with client, stream:
-                async for chunk in stream.aiter_bytes():
-                    yield chunk
-
-        media_type = stream.headers.get("content-type", "video/mp4")
-        resp = StreamingResponse(generate(),
-                                 status_code=stream.status_code,
-                                 media_type=media_type)
-
-        for h in ["content-length", "accept-ranges", "content-range", "etag", "last-modified"]:
-            if h in stream.headers:
-                resp.headers[h] = stream.headers[h]
-        resp.headers["Cache-Control"] = "public, max-age=86400"
-        return resp
+        # Контент-тайп можно оставить дефолтным — Telegram это устраивает
+        return StreamingResponse(body(), media_type="video/mp4")
 
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
