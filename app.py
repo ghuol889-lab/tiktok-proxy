@@ -1,42 +1,32 @@
 # app.py — FastAPI + yt-dlp
-# /api?url=... → JSON c прямым .mp4
-# /dl?url=...  → поток (200/206 + Range) с прогревом cookies и HEAD за длиной,
-#                если длины нет — буферизуем (до MAX_BUFFER_MB) и отдаём с Content-Length
+# /api?url=... → JSON (проксированный URL через воркер)
+# /dl?url=...  → поток через воркер (200/206 + Range), читабельное имя файла
+# ВАЖНО: задайте переменную окружения PROXY_BASE = https://<имя>.workers.dev
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 import yt_dlp
 import httpx
-import re
 import os
-from io import BytesIO
+import re
 from urllib.parse import quote as urlquote
 
 app = FastAPI()
 
-# Максимальный размер «буферной» загрузки в память (МБ)
-MAX_BUFFER_MB = int(os.getenv("MAX_BUFFER_MB", "80"))
-MAX_BUFFER_BYTES = MAX_BUFFER_MB * 1024 * 1024
+PROXY_BASE = os.getenv("PROXY_BASE", "").rstrip("/")
+if not PROXY_BASE:
+    raise RuntimeError('Set env var PROXY_BASE = "https://<name>.workers.dev"')
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124 Safari/537.36"
 )
 
-BASE_CLIENT_HEADERS = {
+BASE_HEADERS = {
     "User-Agent": UA,
-    "Referer": "https://www.tiktok.com/",
-    "Origin": "https://www.tiktok.com",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9,ru-RU;q=0.8,ru;q=0.7",
     "Connection": "keep-alive",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Dest": "document",
-    "TE": "trailers",
 }
 
 def pick_format(info: dict) -> str | None:
@@ -57,19 +47,20 @@ def extract(url: str):
         "noplaylist": True,
         "geo_bypass": True,
         "nocheckcertificate": True,
-        "http_headers": BASE_CLIENT_HEADERS.copy(),
+        "http_headers": {
+            "User-Agent": UA,
+            "Referer": "https://www.tiktok.com/",
+            "Origin": "https://www.tiktok.com",
+        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
     vurl = pick_format(info)
     title = info.get("title")
-    hdrs = (info.get("http_headers") or {}).copy()
-    for k, v in BASE_CLIENT_HEADERS.items():
-        hdrs.setdefault(k, v)
-    return vurl, title, hdrs
+    return vurl, title
 
-def make_filename(title: str | None) -> tuple[str, str]:
+def safe_filename(title: str | None) -> tuple[str, str]:
     base = (title or "video").strip()
     base = re.sub(r'[\\/*?:"<>|]+', "_", base)
     base = re.sub(r"\s+", " ", base).strip()[:80] or "video"
@@ -77,119 +68,72 @@ def make_filename(title: str | None) -> tuple[str, str]:
     fn_ascii = fn_utf8.encode("ascii", "ignore").decode("ascii") or "video.mp4"
     return fn_ascii, fn_utf8
 
+def proxied(url: str) -> str:
+    return f"{PROXY_BASE}/tproxy?u={urlquote(url, safe='')}"
+
 @app.get("/")
 def root():
-    return {"ok": True}
+    return {"ok": True, "proxy": PROXY_BASE}
 
 @app.get("/api")
 def api(url: str):
     try:
-        vurl, title, _ = extract(url)
+        vurl, title = extract(url)
         if not vurl:
             return JSONResponse({"ok": False, "error": "no_video"}, status_code=404)
-        return {"ok": True, "video_url": vurl, "title": title}
+        return {"ok": True, "video_url": proxied(vurl), "title": title}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.get("/dl")
 async def dl(request: Request, url: str):
-    """
-    1) yt-dlp → vurl, заголовки
-    2) прогрев cookies (GET к странице ролика)
-    3) HEAD к vurl → длина/тип
-    4) если есть Range → поток 206; если нет и длины нет — буферизуем полностью
-    """
     try:
-        vurl, title, base_headers = extract(url)
+        vurl, title = extract(url)
         if not vurl:
             return JSONResponse({"ok": False, "error": "no_video"}, status_code=404)
 
-        client = httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=120,
-            headers=base_headers,
-        )
+        purl = proxied(vurl)
 
-        # прогрев страницы ролика — получить куки
-        try:
-            await client.get(url)
-        except Exception:
-            pass
+        headers = dict(BASE_HEADERS)
+        if "range" in request.headers:
+            headers["Range"] = request.headers["range"]
 
-        # HEAD — получаем длину/тип (если отдаёт)
-        head_len = None
-        head_type = None
-        head_accept_ranges = None
-        try:
-            hr = await client.head(vurl, headers=base_headers)
-            if 200 <= hr.status_code < 400:
-                head_len = hr.headers.get("content-length")
-                head_type = hr.headers.get("content-type")
-                head_accept_ranges = hr.headers.get("accept-ranges")
-        except Exception:
-            pass
+        async with httpx.AsyncClient(follow_redirects=True, timeout=120, headers=BASE_HEADERS) as client:
+            # HEAD к воркеру — чтобы узнать длину/тип (если отдаёт)
+            head = await client.head(purl)
+            clen = head.headers.get("content-length")
+            ctype = head.headers.get("content-type", "video/mp4")
 
-        want_range = "range" in request.headers
+            # основной стрим (GET) с поддержкой Range
+            req = client.build_request("GET", purl, headers=headers)
+            upstream = await client.send(req, stream=True)
 
-        # Если это НЕ Range и длины нет — буферизуем, чтобы выдать Content-Length (важно для TG)
-        if not want_range and not head_len:
-            r = await client.get(vurl, headers=base_headers)
-            if r.status_code >= 400:
-                await client.aclose()
-                return JSONResponse({"ok": False, "error": f"bad upstream: {r.status_code}"}, status_code=502)
+            async def gen():
+                try:
+                    async for chunk in upstream.aiter_bytes():
+                        yield chunk
+                finally:
+                    await upstream.aclose()
 
-            content = await r.aread()
-            await client.aclose()
-
-            if len(content) > MAX_BUFFER_BYTES:
-                return JSONResponse(
-                    {"ok": False, "error": f"file too large > {MAX_BUFFER_MB} MB"},
-                    status_code=413,
-                )
-
-            ctype = r.headers.get("content-type", head_type or "video/mp4")
-            fn_ascii, fn_utf8 = make_filename(title)
-            headers = {
-                "Content-Disposition": f'inline; filename="{fn_ascii}"; filename*=UTF-8\'\'{urlquote(fn_utf8)}',
-                "Content-Length": str(len(content)),
-                "Accept-Ranges": head_accept_ranges or "bytes",
-                "Cache-Control": "public, max-age=86400",
-            }
-            return Response(content=content, media_type=ctype, headers=headers, status_code=200)
-
-        # Иначе — нормальный поток (200/206)
-        req_headers = base_headers.copy()
-        if want_range:
-            req_headers["Range"] = request.headers["range"]
-
-        req = client.build_request("GET", vurl, headers=req_headers)
-        upstream = await client.send(req, stream=True)
         status = upstream.status_code
-        ctype = upstream.headers.get("content-type", head_type or "video/mp4")
+        resp = StreamingResponse(gen(), status_code=status, media_type=ctype)
 
-        async def generate():
-            try:
-                async for chunk in upstream.aiter_bytes():
-                    yield chunk
-            finally:
-                await upstream.aclose()
-                await client.aclose()
-
-        resp = StreamingResponse(generate(), status_code=status, media_type=ctype)
-
-        fn_ascii, fn_utf8 = make_filename(title)
+        # Имя файла
+        fn_ascii, fn_utf8 = safe_filename(title)
         resp.headers["Content-Disposition"] = (
             f'inline; filename="{fn_ascii}"; filename*=UTF-8\'\'{urlquote(fn_utf8)}'
         )
 
-        for h in ["content-length", "content-range", "accept-ranges", "etag", "last-modified"]:
+        # Пробрасываем важные заголовки
+        for h in ["content-length", "content-range", "accept-ranges", "etag", "last-modified", "cache-control"]:
             if h in upstream.headers:
                 resp.headers[h] = upstream.headers[h]
 
-        if "content-length" not in resp.headers and head_len and not want_range:
-            resp.headers["Content-Length"] = head_len
+        # Если HEAD дал длину, а апстрим не дал — подставим
+        if "content-length" not in resp.headers and clen and "range" not in request.headers:
+            resp.headers["Content-Length"] = clen
 
-        resp.headers.setdefault("Accept-Ranges", head_accept_ranges or "bytes")
+        resp.headers.setdefault("Accept-Ranges", "bytes")
         resp.headers.setdefault("Cache-Control", "public, max-age=86400")
         return resp
 
