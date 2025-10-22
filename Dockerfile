@@ -1,4 +1,3 @@
-# Лёгкий образ, ffmpeg не ставим (для TikTok обычно не нужен)
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
