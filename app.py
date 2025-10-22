@@ -1,6 +1,8 @@
 # app.py — FastAPI + yt-dlp
 # /api?url=... → JSON с прямым .mp4
-# /dl?url=...  → корректный поток (200/206 + Range), прогрев cookies и имя файла
+# /dl?url=...  → корректный поток (200/206 + Range),
+#                прогрев cookies + HEAD для Content-Length,
+#                красивое имя файла
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -16,7 +18,6 @@ UA = (
     "(KHTML, like Gecko) Chrome/124 Safari/537.36"
 )
 
-# Браузерные заголовки — помогают на TikTok CDN (Akamai)
 BASE_CLIENT_HEADERS = {
     "User-Agent": UA,
     "Referer": "https://www.tiktok.com/",
@@ -24,7 +25,6 @@ BASE_CLIENT_HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9,ru-RU;q=0.8,ru;q=0.7",
     "Connection": "keep-alive",
-    # Доп. «браузерные»:
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Upgrade-Insecure-Requests": "1",
@@ -47,10 +47,6 @@ def pick_format(info: dict) -> str | None:
     return (best or info).get("url")
 
 def extract(url: str):
-    """
-    Возвращаем (video_url, title, headers_from_ydl).
-    yt-dlp иногда отдаёт полезные cookies в http_headers — мы их дополним своими.
-    """
     ydl_opts = {
         "quiet": True,
         "noplaylist": True,
@@ -93,38 +89,52 @@ def api(url: str):
 @app.get("/dl")
 async def dl(request: Request, url: str):
     """
-    Алгоритм:
-      1) yt-dlp → получить vurl + базовые заголовки (с возможными cookies)
-      2) httpx.AsyncClient (одна сессия) → GET к странице ролика (прогрев cookies)
-      3) той же сессией GET stream к vurl, пробрасываем статус/заголовки
+    1) yt-dlp → vurl, заголовки
+    2) httpx.AsyncClient одной сессией:
+       2.1) GET к странице ролика (прогрев cookies)
+       2.2) HEAD к vurl → Content-Length/Type
+       2.3) GET stream к vurl (пробрасываем Range/headers)
     """
     try:
         vurl, title, base_headers = extract(url)
         if not vurl:
             return JSONResponse({"ok": False, "error": "no_video"}, status_code=404)
 
+        client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=120,
+            headers=base_headers,
+        )
+
+        # Прогрев страницы ролика — получить куки
+        try:
+            await client.get(url)
+        except Exception:
+            pass
+
+        # HEAD к mp4 — чтобы узнать длину и тип
+        head_len = None
+        head_type = None
+        head_accept_ranges = None
+        try:
+            hr = await client.head(vurl, headers=base_headers)
+            if 200 <= hr.status_code < 400:
+                head_len = hr.headers.get("content-length")
+                head_type = hr.headers.get("content-type")
+                head_accept_ranges = hr.headers.get("accept-ranges")
+        except Exception:
+            pass
+
+        # Собираем заголовки запроса к mp4
         req_headers = base_headers.copy()
         if "range" in request.headers:
             req_headers["Range"] = request.headers["range"]
 
-        client = httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=120,
-            headers=base_headers,   # выставятся как дефолт
-        )
-
-        # 1) «Прогрев» страницы ролика — получаем нужные cookies
-        try:
-            await client.get(url)
-        except Exception:
-            pass  # даже если прогрев не удался — всё равно попробуем стрим
-
-        # 2) Стримим сам mp4
         req = client.build_request("GET", vurl, headers=req_headers)
         upstream = await client.send(req, stream=True)
 
         status = upstream.status_code
-        ctype = upstream.headers.get("content-type", "video/mp4")
+        ctype  = upstream.headers.get("content-type", head_type or "video/mp4")
 
         async def generate():
             try:
@@ -136,17 +146,23 @@ async def dl(request: Request, url: str):
 
         resp = StreamingResponse(generate(), status_code=status, media_type=ctype)
 
-        # Имя файла для TG/браузера
+        # Имя файла
         fn_ascii, fn_utf8 = make_filename(title)
         resp.headers["Content-Disposition"] = (
             f'inline; filename="{fn_ascii}"; filename*=UTF-8\'\'{urlquote(fn_utf8)}'
         )
 
-        # Пробрасываем важные заголовки
+        # Пробрасываем заголовки от апстрима
         for h in ["content-length", "content-range", "accept-ranges", "etag", "last-modified"]:
             if h in upstream.headers:
                 resp.headers[h] = upstream.headers[h]
-        resp.headers.setdefault("Accept-Ranges", "bytes")
+
+        # Если это не Range-запрос и у нас есть длина из HEAD — выставим её:
+        if "content-length" not in resp.headers and head_len and "range" not in request.headers:
+            resp.headers["Content-Length"] = head_len
+
+        # Запасные значения
+        resp.headers.setdefault("Accept-Ranges", head_accept_ranges or "bytes")
         resp.headers.setdefault("Cache-Control", "public, max-age=86400")
 
         return resp
