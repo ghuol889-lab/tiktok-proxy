@@ -1,7 +1,6 @@
 # app.py — FastAPI + yt-dlp
-# Эндпоинты:
-#   /api?url=... → JSON с прямым .mp4
-#   /dl?url=...  → корректный поток (206/Range) + нормальное имя файла для Telegram
+# /api?url=... → JSON с прямым .mp4
+# /dl?url=...  → корректный поток (200/206 + Range) и нормальное имя файла
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -18,7 +17,6 @@ UA = (
 )
 
 def pick_format(info: dict) -> str | None:
-    """Выбираем лучший mp4 (h264) по высоте и кодеку."""
     fmts = info.get("formats") or []
     def score(f):
         s = 0
@@ -30,8 +28,11 @@ def pick_format(info: dict) -> str | None:
     best = max(fmts, key=score, default=None)
     return (best or info).get("url")
 
-def extract(url: str) -> tuple[str | None, str | None]:
-    """Достаём прямой видео-URL и заголовок ролика."""
+def extract(url: str):
+    """
+    Возвращаем (video_url, title, headers) — headers берём из yt-dlp (там cookies и т.п.)
+    и дополняем своим UA/Referer.
+    """
     ydl_opts = {
         "quiet": True,
         "noplaylist": True,
@@ -41,20 +42,21 @@ def extract(url: str) -> tuple[str | None, str | None]:
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
-    return pick_format(info), info.get("title")
+
+    vurl = pick_format(info)
+    title = info.get("title")
+    hdrs = (info.get("http_headers") or {}).copy()
+    hdrs.setdefault("User-Agent", UA)
+    hdrs.setdefault("Referer", "https://www.tiktok.com/")
+    # Небольшой бонус — некоторые CDN любят Origin/Accept
+    hdrs.setdefault("Origin", "https://www.tiktok.com")
+    hdrs.setdefault("Accept", "*/*")
+    return vurl, title, hdrs
 
 def make_filename(title: str | None) -> tuple[str, str]:
-    """
-    Готовим безопасное имя файла:
-    - ASCII-версия (fallback) для filename="..."
-    - UTF-8 версия для filename*=...
-    """
     base = (title or "video").strip()
     base = re.sub(r'[\\/*?:"<>|]+', "_", base)
-    base = re.sub(r"\s+", " ", base).strip()
-    if not base:
-        base = "video"
-    base = base[:80]
+    base = re.sub(r"\s+", " ", base).strip()[:80] or "video"
     fn_utf8 = f"{base}.mp4"
     fn_ascii = fn_utf8.encode("ascii", "ignore").decode("ascii") or "video.mp4"
     return fn_ascii, fn_utf8
@@ -66,7 +68,7 @@ def root():
 @app.get("/api")
 def api(url: str):
     try:
-        vurl, title = extract(url)
+        vurl, title, _ = extract(url)
         if not vurl:
             return JSONResponse({"ok": False, "error": "no_video"}, status_code=404)
         return {"ok": True, "video_url": vurl, "title": title}
@@ -76,30 +78,27 @@ def api(url: str):
 @app.get("/dl")
 async def dl(request: Request, url: str):
     """
-    Стримим видео и корректно обслуживаем Range-запросы:
-    - Берём статус/заголовки у TikTok ДО отдачи ответа
-    - Пробрасываем Content-Type/Length/Range
-    - Закрываем соединение после завершения генератора
+    Стримим видео и корректно обслуживаем Range:
+    - Берём статус/заголовки у TikTok ДО ответа
+    - Прокидываем все важные заголовки (включая cookies от yt-dlp)
     """
     try:
-        vurl, title = extract(url)
+        vurl, title, base_headers = extract(url)
         if not vurl:
             return JSONResponse({"ok": False, "error": "no_video"}, status_code=404)
 
-        req_headers = {"User-Agent": UA, "Referer": "https://www.tiktok.com/"}
+        # Заголовки для запроса на CDN
+        req_headers = base_headers.copy()
         if "range" in request.headers:
             req_headers["Range"] = request.headers["range"]
 
         client = httpx.AsyncClient(follow_redirects=True, timeout=120)
-
-        # Готовим запрос и открываем поток так, чтобы можно было прочитать headers/status
         req = client.build_request("GET", vurl, headers=req_headers)
         upstream = await client.send(req, stream=True)
 
-        status = upstream.status_code  # 200 или 206 (если пришёл Range)
+        status = upstream.status_code  # 200/206/403...
         ctype  = upstream.headers.get("content-type", "video/mp4")
 
-        # Генератор, который дочитывает поток и закрывает соединение
         async def generate():
             try:
                 async for chunk in upstream.aiter_bytes():
@@ -108,10 +107,9 @@ async def dl(request: Request, url: str):
                 await upstream.aclose()
                 await client.aclose()
 
-        # Собираем ответ сразу со статусом/типом
         resp = StreamingResponse(generate(), status_code=status, media_type=ctype)
 
-        # Имя файла для TG/браузера
+        # Красивое имя файла
         fn_ascii, fn_utf8 = make_filename(title)
         resp.headers["Content-Disposition"] = (
             f'inline; filename="{fn_ascii}"; filename*=UTF-8\'\'{urlquote(fn_utf8)}'
@@ -121,10 +119,8 @@ async def dl(request: Request, url: str):
         for h in ["content-length", "content-range", "accept-ranges", "etag", "last-modified"]:
             if h in upstream.headers:
                 resp.headers[h] = upstream.headers[h]
-        # На всякий случай
         resp.headers.setdefault("Accept-Ranges", "bytes")
         resp.headers.setdefault("Cache-Control", "public, max-age=86400")
-
         return resp
 
     except Exception as e:
