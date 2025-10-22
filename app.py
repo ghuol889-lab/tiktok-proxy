@@ -1,17 +1,22 @@
 # app.py — FastAPI + yt-dlp
-# /api?url=... → JSON с прямым .mp4
-# /dl?url=...  → корректный поток (200/206 + Range),
-#                прогрев cookies + HEAD для Content-Length,
-#                красивое имя файла
+# /api?url=... → JSON c прямым .mp4
+# /dl?url=...  → поток (200/206 + Range) с прогревом cookies и HEAD за длиной,
+#                если длины нет — буферизуем (до MAX_BUFFER_MB) и отдаём с Content-Length
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 import yt_dlp
 import httpx
 import re
+import os
+from io import BytesIO
 from urllib.parse import quote as urlquote
 
 app = FastAPI()
+
+# Максимальный размер «буферной» загрузки в память (МБ)
+MAX_BUFFER_MB = int(os.getenv("MAX_BUFFER_MB", "80"))
+MAX_BUFFER_BYTES = MAX_BUFFER_MB * 1024 * 1024
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -90,10 +95,9 @@ def api(url: str):
 async def dl(request: Request, url: str):
     """
     1) yt-dlp → vurl, заголовки
-    2) httpx.AsyncClient одной сессией:
-       2.1) GET к странице ролика (прогрев cookies)
-       2.2) HEAD к vurl → Content-Length/Type
-       2.3) GET stream к vurl (пробрасываем Range/headers)
+    2) прогрев cookies (GET к странице ролика)
+    3) HEAD к vurl → длина/тип
+    4) если есть Range → поток 206; если нет и длины нет — буферизуем полностью
     """
     try:
         vurl, title, base_headers = extract(url)
@@ -106,13 +110,13 @@ async def dl(request: Request, url: str):
             headers=base_headers,
         )
 
-        # Прогрев страницы ролика — получить куки
+        # прогрев страницы ролика — получить куки
         try:
             await client.get(url)
         except Exception:
             pass
 
-        # HEAD к mp4 — чтобы узнать длину и тип
+        # HEAD — получаем длину/тип (если отдаёт)
         head_len = None
         head_type = None
         head_accept_ranges = None
@@ -125,16 +129,43 @@ async def dl(request: Request, url: str):
         except Exception:
             pass
 
-        # Собираем заголовки запроса к mp4
+        want_range = "range" in request.headers
+
+        # Если это НЕ Range и длины нет — буферизуем, чтобы выдать Content-Length (важно для TG)
+        if not want_range and not head_len:
+            r = await client.get(vurl, headers=base_headers)
+            if r.status_code >= 400:
+                await client.aclose()
+                return JSONResponse({"ok": False, "error": f"bad upstream: {r.status_code}"}, status_code=502)
+
+            content = await r.aread()
+            await client.aclose()
+
+            if len(content) > MAX_BUFFER_BYTES:
+                return JSONResponse(
+                    {"ok": False, "error": f"file too large > {MAX_BUFFER_MB} MB"},
+                    status_code=413,
+                )
+
+            ctype = r.headers.get("content-type", head_type or "video/mp4")
+            fn_ascii, fn_utf8 = make_filename(title)
+            headers = {
+                "Content-Disposition": f'inline; filename="{fn_ascii}"; filename*=UTF-8\'\'{urlquote(fn_utf8)}',
+                "Content-Length": str(len(content)),
+                "Accept-Ranges": head_accept_ranges or "bytes",
+                "Cache-Control": "public, max-age=86400",
+            }
+            return Response(content=content, media_type=ctype, headers=headers, status_code=200)
+
+        # Иначе — нормальный поток (200/206)
         req_headers = base_headers.copy()
-        if "range" in request.headers:
+        if want_range:
             req_headers["Range"] = request.headers["range"]
 
         req = client.build_request("GET", vurl, headers=req_headers)
         upstream = await client.send(req, stream=True)
-
         status = upstream.status_code
-        ctype  = upstream.headers.get("content-type", head_type or "video/mp4")
+        ctype = upstream.headers.get("content-type", head_type or "video/mp4")
 
         async def generate():
             try:
@@ -146,25 +177,20 @@ async def dl(request: Request, url: str):
 
         resp = StreamingResponse(generate(), status_code=status, media_type=ctype)
 
-        # Имя файла
         fn_ascii, fn_utf8 = make_filename(title)
         resp.headers["Content-Disposition"] = (
             f'inline; filename="{fn_ascii}"; filename*=UTF-8\'\'{urlquote(fn_utf8)}'
         )
 
-        # Пробрасываем заголовки от апстрима
         for h in ["content-length", "content-range", "accept-ranges", "etag", "last-modified"]:
             if h in upstream.headers:
                 resp.headers[h] = upstream.headers[h]
 
-        # Если это не Range-запрос и у нас есть длина из HEAD — выставим её:
-        if "content-length" not in resp.headers and head_len and "range" not in request.headers:
+        if "content-length" not in resp.headers and head_len and not want_range:
             resp.headers["Content-Length"] = head_len
 
-        # Запасные значения
         resp.headers.setdefault("Accept-Ranges", head_accept_ranges or "bytes")
         resp.headers.setdefault("Cache-Control", "public, max-age=86400")
-
         return resp
 
     except Exception as e:
